@@ -1,0 +1,282 @@
+"""
+Recipe Trend Collector
+Sammelt täglich trending Rezepte von Reddit und YouTube.
+Ergebnis: trends.json im Root des Repositories.
+"""
+
+import os
+import json
+import re
+import requests
+from datetime import datetime, timezone
+
+
+# ── Config ────────────────────────────────────────────────
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+REDDIT_SUBREDDITS = [
+    "recipes",
+    "food",
+    "Cooking",
+    "EatCheapAndHealthy",
+    "MealPrepSunday",
+    "AskCulinary",
+    "foodhacks",
+    "DinnerIdeas",
+]
+
+YOUTUBE_SEARCH_QUERIES = [
+    "trending recipe 2025",
+    "viral food recipe",
+    "easy dinner recipe trending",
+    "what to cook tonight",
+    "popular recipe this week",
+]
+
+TARGET_COUNT = 100  # Ziel: Top 100 Gerichte
+
+
+# ── Reddit ────────────────────────────────────────────────
+def fetch_reddit_posts():
+    """Holt Top-Posts der Woche von Food-Subreddits ohne Auth."""
+    headers = {"User-Agent": "RecipeTrendBot/1.0"}
+    posts = []
+
+    for subreddit in REDDIT_SUBREDDITS:
+        try:
+            url = f"https://www.reddit.com/r/{subreddit}/top.json?t=week&limit=25"
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                print(f"Reddit {subreddit}: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            items = data.get("data", {}).get("children", [])
+
+            for item in items:
+                post = item.get("data", {})
+                title = post.get("title", "").strip()
+                score = post.get("score", 0)
+                num_comments = post.get("num_comments", 0)
+
+                # Nur Posts mit substantiellem Engagement
+                if score < 100:
+                    continue
+
+                posts.append({
+                    "title": title,
+                    "score": score,
+                    "comments": num_comments,
+                    "source": f"reddit/r/{subreddit}",
+                    "engagement": score + (num_comments * 3),
+                })
+
+            print(f"Reddit r/{subreddit}: {len(items)} Posts geladen")
+
+        except Exception as e:
+            print(f"Reddit r/{subreddit} Fehler: {e}")
+
+    return posts
+
+
+# ── YouTube ───────────────────────────────────────────────
+def fetch_youtube_videos():
+    """Holt trending Koch-Videos von YouTube."""
+    if not YOUTUBE_API_KEY:
+        print("YouTube API Key fehlt – überspringe YouTube")
+        return []
+
+    videos = []
+
+    for query in YOUTUBE_SEARCH_QUERIES:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "videoCategoryId": "26",  # Howto & Style
+                "order": "viewCount",
+                "publishedAfter": "2024-01-01T00:00:00Z",
+                "maxResults": 15,
+                "key": YOUTUBE_API_KEY,
+                "relevanceLanguage": "en",
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                print(f"YouTube Fehler: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            items = data.get("items", [])
+
+            for item in items:
+                snippet = item.get("snippet", {})
+                title = snippet.get("title", "").strip()
+                channel = snippet.get("channelTitle", "")
+
+                videos.append({
+                    "title": title,
+                    "channel": channel,
+                    "source": "youtube",
+                    "engagement": 500,  # Basiswert für YouTube
+                })
+
+            print(f"YouTube '{query}': {len(items)} Videos geladen")
+
+        except Exception as e:
+            print(f"YouTube Fehler bei '{query}': {e}")
+
+    return videos
+
+
+# ── Claude: Rezeptnamen extrahieren ───────────────────────
+def extract_recipe_names(raw_titles):
+    """
+    Lässt Claude aus rohen Titeln saubere Rezeptnamen extrahieren.
+    Filtert Nicht-Rezepte, normalisiert Namen, entfernt Duplikate.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("Anthropic API Key fehlt – verwende einfache Extraktion")
+        return simple_extract(raw_titles)
+
+    # In Batches verarbeiten (max 80 Titel pro Anfrage)
+    all_recipes = []
+    batch_size = 80
+    batches = [raw_titles[i:i+batch_size] for i in range(0, len(raw_titles), batch_size)]
+
+    for i, batch in enumerate(batches):
+        titles_text = "\n".join([f"- {t}" for t in batch])
+
+        prompt = f"""Hier sind Titel von Food-Posts und Koch-Videos aus sozialen Medien:
+
+{titles_text}
+
+Extrahiere daraus eine Liste konkreter Gerichtenamen auf Deutsch.
+
+REGELN:
+1. Nur echte Gerichte – keine allgemeinen Posts ("Was habt ihr heute gegessen?")
+2. Namen auf Deutsch oder international verständlich ("Shakshuka", "Pad Thai" bleiben englisch/original)
+3. Normalisiere: "The BEST pasta carbonara ever!!" → "Pasta Carbonara"
+4. Keine Duplikate – wenn dasselbe Gericht mehrfach vorkommt nur einmal aufführen
+5. Maximal 60 Gerichte aus diesem Batch
+6. Nur Gerichte die realistisch zuhause kochbar sind
+
+Antworte NUR mit JSON-Array:
+["Spaghetti Carbonara", "Butter Chicken", "Shakshuka"]"""
+
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",  # Haiku reicht für diese einfache Aufgabe
+                    "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+
+            if resp.status_code == 200:
+                text = resp.json()["content"][0]["text"]
+                # JSON extrahieren
+                match = re.search(r'\[.*?\]', text, re.DOTALL)
+                if match:
+                    recipes = json.loads(match.group())
+                    all_recipes.extend(recipes)
+                    print(f"Batch {i+1}: {len(recipes)} Rezepte extrahiert")
+            else:
+                print(f"Claude Fehler: HTTP {resp.status_code}")
+                all_recipes.extend(simple_extract(batch))
+
+        except Exception as e:
+            print(f"Claude Fehler: {e}")
+            all_recipes.extend(simple_extract(batch))
+
+    # Deduplizieren
+    seen = set()
+    unique = []
+    for r in all_recipes:
+        key = r.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    return unique
+
+
+def simple_extract(titles):
+    """Einfache Fallback-Extraktion ohne KI."""
+    # Filtere offensichtliche Nicht-Rezepte
+    skip_words = ["what", "how", "why", "best", "worst", "help", "question", "tip", "hack"]
+    results = []
+    for title in titles:
+        title_lower = title.lower()
+        if any(w in title_lower[:20] for w in skip_words):
+            continue
+        # Kürze auf maximal 60 Zeichen
+        clean = re.sub(r'[^\w\s\-]', '', title)[:60].strip()
+        if len(clean) > 5:
+            results.append(clean)
+    return results[:50]
+
+
+# ── Main ──────────────────────────────────────────────────
+def main():
+    print(f"🍳 Recipe Trend Collector startet – {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 60)
+
+    # 1. Daten sammeln
+    print("\n📱 Reddit...")
+    reddit_posts = fetch_reddit_posts()
+    print(f"   → {len(reddit_posts)} Posts gesammelt")
+
+    print("\n▶️  YouTube...")
+    youtube_videos = fetch_youtube_videos()
+    print(f"   → {len(youtube_videos)} Videos gesammelt")
+
+    # 2. Kombinieren und nach Engagement sortieren
+    all_items = reddit_posts + youtube_videos
+    all_items.sort(key=lambda x: x.get("engagement", 0), reverse=True)
+
+    # Rohe Titel für Claude vorbereiten
+    raw_titles = [item["title"] for item in all_items]
+    print(f"\n🤖 Extrahiere Rezeptnamen aus {len(raw_titles)} Titeln...")
+
+    # 3. Claude extrahiert saubere Rezeptnamen
+    recipes = extract_recipe_names(raw_titles)
+    print(f"   → {len(recipes)} eindeutige Rezepte gefunden")
+
+    # 4. Auf Zielanzahl begrenzen
+    top_recipes = recipes[:TARGET_COUNT]
+
+    # 5. Output JSON erstellen
+    output = {
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "updated_date": datetime.now(timezone.utc).strftime("%d.%m.%Y"),
+        "count": len(top_recipes),
+        "source": "Reddit + YouTube (wöchentliche Top-Posts)",
+        "recipes": top_recipes,
+    }
+
+    # 6. Speichern
+    output_path = os.path.join(os.path.dirname(__file__), "..", "trends.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    print(f"\n✅ trends.json gespeichert mit {len(top_recipes)} Rezepten")
+    print("\nTop 10 Trending Rezepte:")
+    for i, recipe in enumerate(top_recipes[:10], 1):
+        print(f"   {i:2d}. {recipe}")
+
+    return True
+
+
+if __name__ == "__main__":
+    success = main()
+    exit(0 if success else 1)
