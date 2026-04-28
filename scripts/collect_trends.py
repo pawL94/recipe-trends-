@@ -16,23 +16,35 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 REDDIT_SUBREDDITS = [
-    "recipes",
-    "food",
-    "Cooking",
-    "EatCheapAndHealthy",
-    "MealPrepSunday",
-    "AskCulinary",
-    "foodhacks",
-    "DinnerIdeas",
+    "recipes",           # Hauptquelle, international
+    "Cooking",           # Allgemein, gut moderiert
+    "EatCheapAndHealthy", # Alltagsküche
+    "MealPrepSunday",    # Westlich geprägt
+    "GifRecipes",        # Viral-Rezepte, divers
+    "europe",            # Europäischer Fokus
+    "germany",           # Deutscher Kontext
+    "1200isplenty",      # Westliche Alltagsküche
 ]
 
 YOUTUBE_SEARCH_QUERIES = [
-    "trending recipe 2025",
-    "viral food recipe",
-    "easy dinner recipe trending",
-    "what to cook tonight",
-    "popular recipe this week",
+    "best dinner recipe 2025 easy",
+    "viral recipe tiktok 2025",
+    "trending dinner ideas Europe",
+    "what to cook this week",
+    "easy weeknight dinner recipe",
+    "popular pasta recipe 2025",
+    "trending chicken recipe",
 ]
+
+# Herkunftsregionen die NICHT überrepräsentiert werden sollen
+# Claude filtert diese beim Extrahieren heraus wenn zu viele kommen
+DIVERSITY_HINT = """
+Achte auf eine AUSGEWOGENE REGIONALE VERTEILUNG:
+- Maximal 10% indische Streetfood-Gerichte (Paratha, Samosa, Pakoda etc.)
+- Bevorzuge: Europäisch, Amerikanisch, Asiatisch (Japan/Korea/Thailand), Mexikanisch, Mediterran
+- Fokus auf Gerichte die in einem deutschen Supermarkt realisierbar sind
+- Keine Snacks oder Streetfood als Hauptgerichte
+"""
 
 TARGET_COUNT = 100  # Ziel: Top 100 Gerichte
 
@@ -153,18 +165,19 @@ def extract_recipe_names(raw_titles):
 
 {titles_text}
 
-Extrahiere daraus eine Liste konkreter Gerichtenamen auf Deutsch.
+Extrahiere daraus eine Liste konkreter Gerichtenamen.
 
 REGELN:
-1. Nur echte Gerichte – keine allgemeinen Posts ("Was habt ihr heute gegessen?")
-2. Namen auf Deutsch oder international verständlich ("Shakshuka", "Pad Thai" bleiben englisch/original)
-3. Normalisiere: "The BEST pasta carbonara ever!!" → "Pasta Carbonara"
-4. Keine Duplikate – wenn dasselbe Gericht mehrfach vorkommt nur einmal aufführen
-5. Maximal 60 Gerichte aus diesem Batch
-6. Nur Gerichte die realistisch zuhause kochbar sind
+1. Nur echte vollstaendige Gerichte – keine Snacks oder Streetfood als Hauptgericht
+2. Keine allgemeinen Posts
+3. Namen auf Deutsch wenn moeglich, Klassiker im Original (Pad Thai, Shakshuka)
+4. Normalisieren: "The BEST pasta ever!!" -> "Pasta Carbonara"
+5. Keine Duplikate, maximal 60 Gerichte
+6. Nur Gerichte die in Deutschland mit Supermarkt-Zutaten kochbar sind
+7. REGIONALE BALANCE: Max 10 Prozent indische Streetfood-Gerichte, bevorzuge Europaeisch/Amerikanisch/Asiatisch/Mexikanisch/Mediterran
 
 Antworte NUR mit JSON-Array:
-["Spaghetti Carbonara", "Butter Chicken", "Shakshuka"]"""
+["Spaghetti Carbonara", "Butter Chicken", "Shakshuka", "Haehnchen-Curry"]"""
 
         try:
             resp = requests.post(
