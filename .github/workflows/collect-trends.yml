@@ -1,45 +1,299 @@
-name: Collect Recipe Trends
+"""
+Recipe Trend Collector
+Sammelt täglich trending Rezepte von Reddit und YouTube.
+Ergebnis: trends.json im Root des Repositories.
+"""
 
-on:
-  schedule:
-    # Läuft täglich um 06:00 UTC (08:00 deutsche Zeit)
-    - cron: '0 6 * * *'
-  # Manuell auslösbar für Tests
-  workflow_dispatch:
+import os
+import json
+import re
+import requests
+from datetime import datetime, timezone
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-jobs:
-  collect:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write  # Erlaubt das Committen von trends.json
+# ── Config ────────────────────────────────────────────────
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-    steps:
-      - name: Repository auschecken
-        uses: actions/checkout@v4
+REDDIT_SUBREDDITS = [
+    "recipes",           # Hauptquelle, international
+    "Cooking",           # Allgemein, gut moderiert
+    "EatCheapAndHealthy", # Alltagsküche
+    "MealPrepSunday",    # Westlich geprägt
+    "GifRecipes",        # Viral-Rezepte, divers
+    "europe",            # Europäischer Fokus
+    "germany",           # Deutscher Kontext
+    "1200isplenty",      # Westliche Alltagsküche
+]
 
-      - name: Python einrichten
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
+YOUTUBE_SEARCH_QUERIES = [
+    "best dinner recipe 2025 easy",
+    "viral recipe tiktok 2025",
+    "trending dinner ideas Europe",
+    "what to cook this week",
+    "easy weeknight dinner recipe",
+    "popular pasta recipe 2025",
+    "trending chicken recipe",
+]
 
-      - name: Abhängigkeiten installieren
-        run: pip install -r requirements.txt
+# Herkunftsregionen die NICHT überrepräsentiert werden sollen
+# Claude filtert diese beim Extrahieren heraus wenn zu viele kommen
+DIVERSITY_HINT = """
+Achte auf eine AUSGEWOGENE REGIONALE VERTEILUNG:
+- Maximal 10% indische Streetfood-Gerichte (Paratha, Samosa, Pakoda etc.)
+- Bevorzuge: Europäisch, Amerikanisch, Asiatisch (Japan/Korea/Thailand), Mexikanisch, Mediterran
+- Fokus auf Gerichte die in einem deutschen Supermarkt realisierbar sind
+- Keine Snacks oder Streetfood als Hauptgerichte
+"""
 
-      - name: Trends sammeln
-        env:
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python scripts/collect_trends.py
+TARGET_COUNT = 100  # Ziel: Top 100 Gerichte
 
-      - name: trends.json committen und pushen
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "Trend Bot"
-          git add trends.json
-          # Nur committen wenn sich etwas geändert hat
-          git diff --staged --quiet || git commit -m "🍳 Trends aktualisiert: $(date '+%d.%m.%Y')"
-          git push
+
+# ── Reddit ────────────────────────────────────────────────
+def fetch_reddit_posts():
+    """Holt Top-Posts der Woche von Food-Subreddits ohne Auth."""
+    headers = {"User-Agent": "RecipeTrendBot/1.0"}
+    posts = []
+
+    for subreddit in REDDIT_SUBREDDITS:
+        try:
+            url = f"https://www.reddit.com/r/{subreddit}/top.json?t=week&limit=25"
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                print(f"Reddit {subreddit}: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            items = data.get("data", {}).get("children", [])
+
+            for item in items:
+                post = item.get("data", {})
+                title = post.get("title", "").strip()
+                score = post.get("score", 0)
+                num_comments = post.get("num_comments", 0)
+
+                # Nur Posts mit substantiellem Engagement
+                if score < 100:
+                    continue
+
+                posts.append({
+                    "title": title,
+                    "score": score,
+                    "comments": num_comments,
+                    "source": f"reddit/r/{subreddit}",
+                    "engagement": score + (num_comments * 3),
+                })
+
+            print(f"Reddit r/{subreddit}: {len(items)} Posts geladen")
+
+        except Exception as e:
+            print(f"Reddit r/{subreddit} Fehler: {e}")
+
+    return posts
+
+
+# ── YouTube ───────────────────────────────────────────────
+def fetch_youtube_videos():
+    """Holt trending Koch-Videos von YouTube."""
+    if not YOUTUBE_API_KEY:
+        print("YouTube API Key fehlt – überspringe YouTube")
+        return []
+
+    videos = []
+
+    for query in YOUTUBE_SEARCH_QUERIES:
+        try:
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "videoCategoryId": "26",  # Howto & Style
+                "order": "viewCount",
+                "publishedAfter": "2024-01-01T00:00:00Z",
+                "maxResults": 15,
+                "key": YOUTUBE_API_KEY,
+                "relevanceLanguage": "en",
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                print(f"YouTube Fehler: HTTP {resp.status_code}")
+                continue
+
+            data = resp.json()
+            items = data.get("items", [])
+
+            for item in items:
+                snippet = item.get("snippet", {})
+                title = snippet.get("title", "").strip()
+                channel = snippet.get("channelTitle", "")
+
+                videos.append({
+                    "title": title,
+                    "channel": channel,
+                    "source": "youtube",
+                    "engagement": 500,  # Basiswert für YouTube
+                })
+
+            print(f"YouTube '{query}': {len(items)} Videos geladen")
+
+        except Exception as e:
+            print(f"YouTube Fehler bei '{query}': {e}")
+
+    return videos
+
+
+# ── Claude: Rezeptnamen extrahieren ───────────────────────
+def extract_recipe_names(raw_titles):
+    """
+    Lässt Claude aus rohen Titeln saubere Rezeptnamen extrahieren.
+    Filtert Nicht-Rezepte, normalisiert Namen, entfernt Duplikate.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("Anthropic API Key fehlt – verwende einfache Extraktion")
+        return simple_extract(raw_titles)
+
+    # In Batches verarbeiten (max 80 Titel pro Anfrage)
+    all_recipes = []
+    batch_size = 80
+    batches = [raw_titles[i:i+batch_size] for i in range(0, len(raw_titles), batch_size)]
+
+    for i, batch in enumerate(batches):
+        titles_text = "\n".join([f"- {t}" for t in batch])
+
+        prompt = f"""Hier sind Titel von Food-Posts und Koch-Videos aus sozialen Medien:
+
+{titles_text}
+
+Extrahiere daraus eine kuratierte Liste ECHTER, BEKANNTER Gerichtenamen.
+
+STRENGE REGELN:
+1. NUR Gerichte mit einem echten, etablierten Namen – KEIN generisches "Haehnchen-Pfanne", "Gemuese-Suppe", "Fleisch mit Kartoffeln"
+2. Der Name muss spezifisch sein: "Butter Chicken" ja, "Haehnchen-Curry" nein; "Pasta Carbonara" ja, "Sahne-Pasta" nein
+3. Bekannte internationale Klassiker behalten: "Shakshuka", "Pad Thai", "Birria Tacos", "Marry Me Chicken"
+4. KEIN indisches Streetfood: kein Paratha, Samosa, Pakoda, Jalebi, Kachori, Bhindi, Aloo Sabzi etc.
+5. Keine Suessigkeiten/Desserts ausser sie sind klar trending (z.B. Tiramisu)
+6. Maximal 60 Gerichte, keine Duplikate
+7. Nur Gerichte die in Deutschland mit normalen Zutaten kochbar sind
+8. REGIONALE VERTEILUNG: 40% Europaeisch, 25% Amerikanisch, 20% Asiatisch, 15% Rest der Welt
+
+Gute Beispiele: Pasta Carbonara, Shakshuka, Butter Chicken, Birria Tacos, Pilz-Risotto, Lachsteriyaki, Schnitzel, Moussaka, Pad Thai, Marry Me Chicken
+Schlechte Beispiele: Haehnchen-Pfanne, Gemuese-Auflauf, Paratha, Bread Roll, Sandwich, Kartoffelgericht
+
+Antworte NUR mit JSON-Array:
+["Pasta Carbonara", "Shakshuka", "Butter Chicken", "Birria Tacos"]"""
+
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",  # Haiku reicht für diese einfache Aufgabe
+                    "max_tokens": 1000,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+
+            if resp.status_code == 200:
+                text = resp.json()["content"][0]["text"]
+                # JSON extrahieren
+                match = re.search(r'\[.*?\]', text, re.DOTALL)
+                if match:
+                    recipes = json.loads(match.group())
+                    all_recipes.extend(recipes)
+                    print(f"Batch {i+1}: {len(recipes)} Rezepte extrahiert")
+            else:
+                print(f"Claude Fehler: HTTP {resp.status_code}")
+                all_recipes.extend(simple_extract(batch))
+
+        except Exception as e:
+            print(f"Claude Fehler: {e}")
+            all_recipes.extend(simple_extract(batch))
+
+    # Deduplizieren
+    seen = set()
+    unique = []
+    for r in all_recipes:
+        key = r.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    return unique
+
+
+def simple_extract(titles):
+    """Einfache Fallback-Extraktion ohne KI."""
+    # Filtere offensichtliche Nicht-Rezepte
+    skip_words = ["what", "how", "why", "best", "worst", "help", "question", "tip", "hack"]
+    results = []
+    for title in titles:
+        title_lower = title.lower()
+        if any(w in title_lower[:20] for w in skip_words):
+            continue
+        # Kürze auf maximal 60 Zeichen
+        clean = re.sub(r'[^\w\s\-]', '', title)[:60].strip()
+        if len(clean) > 5:
+            results.append(clean)
+    return results[:50]
+
+
+# ── Main ──────────────────────────────────────────────────
+def main():
+    print(f"🍳 Recipe Trend Collector startet – {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print("=" * 60)
+
+    # 1. Daten sammeln
+    print("\n📱 Reddit...")
+    reddit_posts = fetch_reddit_posts()
+    print(f"   → {len(reddit_posts)} Posts gesammelt")
+
+    print("\n▶️  YouTube...")
+    youtube_videos = fetch_youtube_videos()
+    print(f"   → {len(youtube_videos)} Videos gesammelt")
+
+    # 2. Kombinieren und nach Engagement sortieren
+    all_items = reddit_posts + youtube_videos
+    all_items.sort(key=lambda x: x.get("engagement", 0), reverse=True)
+
+    # Rohe Titel für Claude vorbereiten
+    raw_titles = [item["title"] for item in all_items]
+    print(f"\n🤖 Extrahiere Rezeptnamen aus {len(raw_titles)} Titeln...")
+
+    # 3. Claude extrahiert saubere Rezeptnamen
+    recipes = extract_recipe_names(raw_titles)
+    print(f"   → {len(recipes)} eindeutige Rezepte gefunden")
+
+    # 4. Auf Zielanzahl begrenzen
+    top_recipes = recipes[:TARGET_COUNT]
+
+    # 5. Output JSON erstellen
+    output = {
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "updated_date": datetime.now(timezone.utc).strftime("%d.%m.%Y"),
+        "count": len(top_recipes),
+        "source": "Reddit + YouTube (wöchentliche Top-Posts)",
+        "recipes": top_recipes,
+    }
+
+    # 6. Speichern
+    output_path = os.path.join(os.path.dirname(__file__), "..", "trends.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    print(f"\n✅ trends.json gespeichert mit {len(top_recipes)} Rezepten")
+    print("\nTop 10 Trending Rezepte:")
+    for i, recipe in enumerate(top_recipes[:10], 1):
+        print(f"   {i:2d}. {recipe}")
+
+    return True
+
+
+if __name__ == "__main__":
+    success = main()
+    exit(0 if success else 1)
