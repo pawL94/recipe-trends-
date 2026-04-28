@@ -69,7 +69,7 @@ def curate_with_claude(mealdb_names, reddit_titles):
     mealdb_text = "\n".join([f"- {n}" for n in mealdb_names[:150]])
     reddit_text = "\n".join([f"- {t}" for t in reddit_titles[:50]])
 
-    prompt = f"""Du bist ein Kulinarik-Experte. Erstelle eine Liste der 100 bekanntesten internationalen Gerichte.
+    prompt = f"""Du bist ein Kulinarik-Experte. Erstelle eine kuratierte, geclusterte Liste internationaler Gerichte.
 
 DATENBASIS A - Internationale Klassiker (TheMealDB):
 {mealdb_text}
@@ -78,21 +78,22 @@ DATENBASIS B - Aktuelle Reddit-Trends (Rohtitel):
 {reddit_text}
 
 AUFGABE:
-1. Waehle hauptsaechlich aus Datenbasis A - bevorzuge bekannte Klassiker
-2. Ergaenze aus B nur echte etablierte Gerichte mit klarem Namen
-3. Uebersetze ins Deutsche wo sinnvoll (Spaghetti Carbonara, Wiener Schnitzel etc.)
-4. Sortiere nach globaler Bekanntheit
+Erstelle eine JSON-Struktur mit 4 Kategorien passend zu einer Koch-App:
+- Herzhaft: Fleischgerichte, herzhafte Pasta, Eintöpfe, sättigende Gerichte (60 Gerichte)
+- Leicht: Salate, Suppen, Gemüsegerichte, leichte Küche (25 Gerichte)
+- Dessert: Nachspeisen, süße Gerichte (10 Gerichte)
+- Ueberrasch: Ungewöhnliche, kreative, überraschende Gerichte (15 Gerichte)
 
-NICHT aufnehmen:
-- Generisch: "Haehnchen-Pfanne", "Gemuese-Suppe", "Fleisch mit Reis"
-- Indisches Streetfood: Paratha, Samosa, Kachori, Pakoda, Roti, Bhindi
-- Getraenke, Snacks, Suessigkeiten (ausser Dessert-Klassiker wie Tiramisu)
-- Nicht in Deutschland nachkochbar
+REGELN:
+1. Nur echte etablierte Gerichte mit klarem Namen
+2. Bevorzuge bekannte internationale Klassiker aus Datenbasis A
+3. Ergaenze aktuelle Trends aus Datenbasis B wenn passend
+4. NICHT: generische Namen, indisches Streetfood, Getraenke, nicht in Deutschland nachkochbar
+5. Uebersetze ins Deutsche wo natuerlich (Spaetzle, Schnitzel, Gulasch)
+6. Zielverteilung: 35% Europaeisch, 25% Asiatisch, 20% Amerikanisch, 20% Rest
 
-ZIELVERTEILUNG: 35% Europaeisch, 25% Asiatisch, 20% Amerikanisch, 20% Rest
-
-Antworte NUR mit JSON-Array:
-["Pasta Carbonara", "Shakshuka", "Butter Chicken", "Wiener Schnitzel"]"""
+Antworte NUR mit JSON:
+{{"Herzhaft":["Spaghetti Bolognese","Butter Chicken"],"Leicht":["Gazpacho","Ratatouille"],"Dessert":["Tiramisu","Creme Brulee"],"Ueberrasch":["Bibimbap","Shakshuka"]}}"""
 
     try:
         resp = requests.post(
@@ -111,10 +112,18 @@ Antworte NUR mit JSON-Array:
         )
         if resp.status_code == 200:
             text = resp.json()["content"][0]["text"]
+            # Try clustered JSON first
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                clusters = json.loads(match.group())
+                if isinstance(clusters, dict) and "Herzhaft" in clusters:
+                    print(f"Claude: geclusterte Liste erstellt")
+                    return clusters
+            # Fallback: flat list
             match = re.search(r'\[.*?\]', text, re.DOTALL)
             if match:
                 recipes = json.loads(match.group())
-                print(f"Claude: {len(recipes)} Rezepte kuratiert")
+                print(f"Claude: {len(recipes)} Rezepte (ungeclustert)")
                 return recipes
     except Exception as e:
         print(f"Claude Fehler: {e}")
@@ -137,13 +146,25 @@ def main():
     print("\nKuratierung...")
     recipes = curate_with_claude(mealdb_names, reddit_titles)
 
-    output = {
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "updated_date": datetime.now(timezone.utc).strftime("%d.%m.%Y"),
-        "count": len(recipes),
-        "source": "TheMealDB + Reddit (kuratiert von Claude)",
-        "recipes": recipes,
-    }
+    # Handle both clustered dict and flat list
+    if isinstance(recipes, dict):
+        all_flat = [r for v in recipes.values() for r in v]
+        output = {
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_date": datetime.now(timezone.utc).strftime("%d.%m.%Y"),
+            "count": len(all_flat),
+            "source": "TheMealDB + Reddit (kuratiert von Claude)",
+            "clusters": recipes,
+            "recipes": all_flat,
+        }
+    else:
+        output = {
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "updated_date": datetime.now(timezone.utc).strftime("%d.%m.%Y"),
+            "count": len(recipes),
+            "source": "TheMealDB + Reddit (kuratiert von Claude)",
+            "recipes": recipes,
+        }
 
     output_path = os.path.join(os.path.dirname(__file__), "..", "trends.json")
     with open(output_path, "w", encoding="utf-8") as f:
