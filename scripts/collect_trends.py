@@ -170,9 +170,10 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"\nErgebnis: {len(recipes)} Rezepte gespeichert")
+    display_list = all_flat if isinstance(recipes, dict) else recipes
+    print(f"\nErgebnis: {len(display_list)} Rezepte gespeichert")
     print("\nTop 15:")
-    for i, r in enumerate(recipes[:15], 1):
+    for i, r in enumerate(display_list[:15], 1):
         print(f"  {i:2d}. {r}")
     return True
 
